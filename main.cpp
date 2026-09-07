@@ -10,7 +10,8 @@ namespace fs = std::filesystem;
 
 #ifdef _WIN32
 	#include <windows.h>
-	
+	#include <shellapi.h>
+
 	void set_utf8_console()
 	{
 	    SetConsoleOutputCP(CP_UTF8);
@@ -27,9 +28,9 @@ namespace fs = std::filesystem;
 	}
 #endif
 
-const std::string is_active_link = "https://zsnr1dzialdowo-my.sharepoint.com/:t:/g/personal/acejman_zsnr1_com/IQCMupNwkvR7RLeBYqXei5R2AbQNCyNdg1W8qqJOp9jcBRk?download=1";
+const std::string is_active_link = "https://raw.githubusercontent.com/Adrian5860/launcher.v2/main/is_active.txt";
 const std::string pinecone_link  = "https://github.com/ElyPrismLauncher/Launcher/releases/download/11.1.0/PineconeMC-Windows-MSVC-Portable-11.1.0.zip";
-const std::string modpack_link   = "https://zsnr1dzialdowo-my.sharepoint.com/:u:/g/personal/acejman_zsnr1_com/IQDsmOD5-GORS6ulEwA54x1wAYk0zWOduEw6HnmhkeV9Ngw?download=1";
+const std::string modpack_link   = "https://raw.githubusercontent.com/Adrian5860/launcher.v2/main/ligma_modpack.zip";
 std::string Username             = "";
 
 MultiDownloader dl(1);
@@ -47,11 +48,10 @@ void clear_input()
 // -------------------------------------------------------------------------
 //  Uruchamia zewnetrzny program. `args` to lista osobnych argumentow,
 //  zeby uniknac problemow z cytowaniem sciezek zawierajacych spacje.
-//  Zaklada wzgledne sciezki bez polskich znakow (patrz dyskusja o ANSI/UTF-8).
+//  Zaklada wzgledne sciezki bez polskich znakow.
 // -------------------------------------------------------------------------
 bool create_process(const std::string& exePath,
-                     const std::vector<std::string>& args,
-                     bool waitForExit = true)
+                     const std::vector<std::string>& args)
 {
 #ifdef _WIN32
     std::ostringstream cmd;
@@ -68,16 +68,13 @@ bool create_process(const std::string& exePath,
     PROCESS_INFORMATION pi{};
 
     BOOL ok = CreateProcessA(nullptr, buf.data(), nullptr, nullptr,
-                              FALSE, 0, nullptr, nullptr, &si, &pi);
+                              FALSE, 0, nullptr, "pinecone", &si, &pi);
     if (!ok)
     {
         std::cerr << "Nie udalo sie uruchomic: " << exePath
                    << " (kod bledu: " << GetLastError() << ")\n";
         return false;
     }
-
-    if (waitForExit)
-        WaitForSingleObject(pi.hProcess, INFINITE);
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
@@ -93,6 +90,19 @@ bool create_process(const std::string& exePath,
 
     if (pid == 0)
     {
+        // dziecko: odlacz od terminala/sesji rodzica
+        setsid();
+
+        // drugi fork - zeby wnuk zostal "sierota" przejeta przez init,
+        // a nie pozostal zwiazany z (juz konczacym sie) pierwszym dzieckiem
+        pid_t pid2 = fork();
+        if (pid2 < 0)
+            std::exit(1);
+
+        if (pid2 > 0)
+            std::exit(0); // pierwsze dziecko konczy sie natychmiast
+
+        // tutaj jestesmy juz we wnuku - odlaczonym, niezaleznym procesie
         std::vector<char*> argv;
         argv.push_back(const_cast<char*>(exePath.c_str()));
         for (auto& a : args)
@@ -103,11 +113,17 @@ bool create_process(const std::string& exePath,
         std::exit(127); // execv wraca tylko przy bledzie
     }
 
+    // rodzic: odbiera pierwsze dziecko (ktore zaraz samo sie konczy),
+    // zeby nie zostawic zombie
+    int status = 0;
+    waitpid(pid, &status, 0);
+
     if (waitForExit)
     {
-        int status = 0;
-        waitpid(pid, &status, 0);
-        return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        // UWAGA: nie mamy juz PID-u wnuka, wiec prawdziwe "czekanie na
+        // wnuka" nie jest tu mozliwe w prosty sposob - patrz uwaga nizej
+        std::cerr << "Ostrzezenie: waitForExit=true nie jest w pelni obslugiwane "
+                     "przy odlaczonym procesie potomnym na Linuksie.\n";
     }
     return true;
 #endif
@@ -182,8 +198,10 @@ bool extract_archive(const std::string& archivePath, const std::string& destDir)
 // -------------------------------------------------------------------------
 void import_modpack()
 {
-    if(fs::exists("pinecone/instances/ligma_modpack")) //???
+    if(fs::exists("pinecone/instances/ligma_modpack/minecraft")) //???
     {
+        if(fs::exists("ligma_modpack.zip")) fs::remove("ligma_modpack.zip");
+
         return;
     }
     else
@@ -219,34 +237,36 @@ void import_modpack()
 // -------------------------------------------------------------------------
 void check_installation()
 {
-    if(!fs::exists("pinecone/elyprismlauncher.exe"))
+    if(fs::exists("pinecone/elyprismlauncher.exe"))
     {
-        std::cout << "Nie znaleziono zainstalowanego launchera.\n";
+        std::cout << "PineconeMC jest już zainstalowany.\n";
+        
+        if(fs::exists("PineconeMC.zip")) fs::remove("PineconeMC.zip");
 
-        if(!fs::exists("PineconeMC.zip"))
-        {
-            std::cout << "Pobieranie...\n";
-            
-            dl.addDownload(pinecone_link, "PineconeMC.zip");
-            if (!dl.start())
-            {
-                std::cerr << "Pobieranie nie powiodlo sie, przerywam.\n";
-                return;
-            }
-        }
-        else
-        {
-            std::cout << "PineconeMC.zip jest już pobrany.";
-        }
+        return;
+    }
 
-        if(extract_archive("PineconeMC.zip", "pinecone"))
+    std::cout << "Nie znaleziono zainstalowanego launchera.\n";
+
+    if(!fs::exists("PineconeMC.zip"))
+    {
+        std::cout << "Pobieranie...\n";
+        
+        dl.addDownload(pinecone_link, "PineconeMC.zip");
+        if (!dl.start())
         {
-            fs::remove("PineconeMC.zip");
+            std::cerr << "Pobieranie nie powiodlo sie, przerywam.\n";
+            return;
         }
     }
     else
     {
-        std::cout << "PineconeMC jest już zainstalowany.\n";
+        std::cout << "PineconeMC.zip jest już pobrany.";
+    }
+
+    if(extract_archive("PineconeMC.zip", "pinecone"))
+    {
+        fs::remove("PineconeMC.zip");
     }
 }
 
@@ -360,7 +380,8 @@ bool patch_it()
 // -------------------------------------------------------------------------
 void launch_game()
 {
-    create_process("pinecone/elyprismlauncher.exe", {"-l ligma_modpack", "-a" + Username}, false);
+    create_process("pinecone\\elyprismlauncher.exe", {"-lligma_modpack", "-a" + Username});
+    std::exit(0);
 }
 
 void setup(fs::path file)
