@@ -1,0 +1,453 @@
+Jak to działa:
+
+**Struktura**
+- `CurlGlobalGuard` — RAII na `curl_global_init`/`curl_global_cleanup`.
+- `DownloadItem` — stan jednego pliku (atomiki: pobrane/łącznie bajtów, `finished`, `failed`).
+- `make_curl()` — dokładnie o to prosiłeś: tworzy `CURL*` z sensownymi opcjami (redirecty, timeout, SSL, User-Agent, `FAILONERROR`).
+- `MultiDownloader` — kolejka plików + pula wątków roboczych + osobny wątek rysujący pasek postępu.
+
+**Wielowątkowość**: podajesz `maxThreads` w konstruktorze — tyle plików leci równolegle na raz, reszta czeka w kolejce (`std::queue` + `std::mutex`). Każdy wątek roboczy bierze kolejny task, robi własny `curl_easy_perform`, więc pliki nie blokują się nawzajem.
+
+**Pasek postępu**: osobny wątek co ~150ms zbiera sumę pobranych/całkowitych bajtów ze wszystkich `DownloadItem` (przez `CURLOPT_XFERINFOFUNCTION`) i rysuje coś w stylu:
+
+```
+Pobieranie: [##############----------------]  46.2%  (2/5 plikow)  120.4 MB / 260.7 MB  8.3 MB/s   
+```
+
+na jednej linii (`\r`), dokładnie jak progress bar przy rozpakowywaniu w PowerShellu.
+
+**Użycie w Twoim .cpp**:
+```cpp
+#include "MultiDownloader.h"
+
+int main() {
+    MultiDownloader dl(4); // max 4 pliki naraz
+    dl.addDownload("https://example.com/plik1.zip", "plik1.zip");
+    dl.addDownload("https://example.com/plik2.zip", "plik2.zip");
+    dl.start(); // blokuje, pokazuje pasek, na koniec drukuje podsumowanie OK/BLAD
+}
+```
+
+Link: `-lcurl` (na mingw-w64 czasem trzeba dorzucić `-lws2_32 -lcrypt32 -lwldap32`, zależnie od tego jak zbudowany jest Twój curl 8.22.0).
+
+
+# `#pragma once`
+
+To dyrektywa preprocesora (nie C++, tylko coś co obrabia preprocesor **zanim** kompilator zobaczy kod). Mówi: *"ten plik nagłówkowy ma zostać wczytany do jednej jednostki translacji (czyli do jednego pliku .cpp, razem z tym co on `#include`uje) tylko raz, nawet jeśli ktoś go `#include`uje wielokrotnie"*.
+
+### Po co to jest?
+
+Wyobraź sobie, że masz:
+
+```
+MultiDownloader.h
+main.cpp        -> #include "MultiDownloader.h"
+network.h       -> #include "MultiDownloader.h"
+main.cpp        -> #include "network.h"
+```
+
+`main.cpp` w praktyce zawiera treść `MultiDownloader.h` **dwa razy** (raz bezpośrednio, raz przez `network.h`), bo `#include` to dosłownie "wklej tu zawartość tego pliku". Bez zabezpieczenia kompilator zobaczyłby dwie definicje klasy `MultiDownloader`, dwie definicje `make_curl()` itd. w jednym pliku źródłowym i wywalił błąd **redefinition** (naruszenie tzw. One Definition Rule — ODR).
+
+### Jak to działa "pod maską"
+
+Kompilator/preprocesor pamięta, które pliki (po ścieżce/identyfikatorze pliku) już raz "przepuścił" w danej jednostce translacji z `#pragma once` na górze. Jeśli widzi drugi `#include` tego samego pliku — po prostu go ignoruje, jakby go tam nie było.
+
+### Alternatywa (starsza, przenośniejsza)
+
+Zanim `#pragma once` stał się standardem *de facto*, robiło się to ręcznie makrami:
+
+```cpp
+#ifndef MULTIDOWNLOADER_H
+#define MULTIDOWNLOADER_H
+// ... cała zawartość pliku ...
+#endif
+```
+
+Działa identycznie: pierwszy raz `MULTIDOWNLOADER_H` nie jest zdefiniowany, więc wchodzi w blok i definiuje makro; drugi raz `#ifndef` widzi, że makro już istnieje, i pomija całą resztę do `#endif`.
+
+`#pragma once` jest krótsze, mniej podatne na literówki (nie trzeba wymyślać unikalnej nazwy makra) i wspierane przez każdy liczący się kompilator (MSVC, GCC, Clang, MinGW), ale technicznie nie jest częścią standardu C++ — to rozszerzenie kompilatora. W praktyce nikt się tym dziś nie przejmuje.
+
+---
+
+# Reszta pliku — funkcja po funkcji
+
+## `CurlGlobalGuard`
+
+```cpp
+class CurlGlobalGuard
+{
+public:
+    CurlGlobalGuard()  { curl_global_init(CURL_GLOBAL_DEFAULT); }
+    ~CurlGlobalGuard() { curl_global_cleanup(); }
+
+    CurlGlobalGuard(const CurlGlobalGuard&)            = delete;
+    CurlGlobalGuard& operator=(const CurlGlobalGuard&) = delete;
+};
+```
+
+To wzorzec **RAII** (Resource Acquisition Is Initialization) — zasobem tutaj jest globalny stan biblioteki libcurl.
+
+- **Konstruktor** wywołuje `curl_global_init(CURL_GLOBAL_DEFAULT)`. Dokumentacja libcurl wymaga, żeby ta funkcja została wywołana **dokładnie raz**, **zanim** jakikolwiek wątek zacznie używać curla (inicjalizuje np. podsystem SSL). `CURL_GLOBAL_DEFAULT` to flaga mówiąca "zainicjalizuj wszystko co standardowo potrzebne" (SSL + obsługa Win32 socketów na Windows).
+- **Destruktor** wywołuje `curl_global_cleanup()` — sprząta to, co zainicjalizował `curl_global_init`. Musi się wykonać **po** tym, jak wszystkie wątki skończą używać curla.
+- **Usunięte konstruktor kopiujący i operator przypisania** (`= delete`): to zabezpieczenie, żeby nikt przypadkiem nie skopiował tego obiektu. Gdyby ktoś zrobił kopię, powstałyby dwa obiekty i przy niszczeniu obu `curl_global_cleanup()` wywołałoby się dwa razy — a to jest błąd (podwójne sprzątanie tego samego globalnego zasobu). Usuwając te funkcje, kompilator zgłosi błąd kompilacji, jeśli ktoś spróbuje skopiować `CurlGlobalGuard`.
+
+Obiekt tej klasy jest polem w `MultiDownloader` (`globalGuard_`), więc żyje dokładnie tyle, co obiekt downloadera — init przy tworzeniu, cleanup przy niszczeniu. Nie musisz o tym pamiętać ręcznie.
+
+---
+
+## `DownloadItem`
+
+```cpp
+struct DownloadItem
+{
+    std::string url;
+    std::string outputPath;
+
+    std::atomic<curl_off_t> downloadedBytes{0};
+    std::atomic<curl_off_t> totalBytes{0};
+    std::atomic<bool>       finished{false};
+    std::atomic<bool>       failed{false};
+    std::string             errorMessage;
+};
+```
+
+To nie funkcja, ale kluczowa struktura danych, więc krótko:
+
+- `url`, `outputPath` — statyczne dane, ustawiane raz przy `addDownload`, nigdy potem nie zmieniane — nie muszą być atomowe.
+- `downloadedBytes` / `totalBytes` — te pola są **zapisywane** przez wątek roboczy (w `progressCallback`, wywoływanym przez curla wewnątrz `curl_easy_perform`) i **czytane** przez zupełnie inny wątek (ten rysujący pasek postępu, w `renderProgress`). Gdy dwa wątki dotykają tej samej zmiennej i przynajmniej jeden zapisuje — to jest tzw. *data race*, czyli zachowanie niezdefiniowane w C++ jeśli zwykły `long long` byłby użyty bez synchronizacji. `std::atomic<curl_off_t>` gwarantuje, że odczyt/zapis są niepodzielne (atomowe) i widoczne między wątkami bez muteksa.
+- `curl_off_t` to typ zdefiniowany przez libcurl na potrzeby rozmiarów transferu (zwykle 64-bitowy int, żeby obsłużyć pliki >4GB nawet na systemach 32-bitowych).
+- `finished`, `failed` — flagi ustawiane raz na koniec pobierania danego pliku, odczytywane przez wątek rysujący pasek i przez `start()` na końcu.
+- `errorMessage` — celowo **nie** jest atomowy/synchronizowany osobno, bo jest ustawiany w `downloadOne` **przed** ustawieniem `finished = true`. Dzięki temu, że `finished` jest `std::atomic`, zapis do `errorMessage` "happens-before" ustawienie `finished`, więc gdy inny wątek zobaczy `finished == true`, ma też gwarancję zobaczenia poprawnego `errorMessage` (to jest tzw. release-acquire ordering, domyślne dla `std::atomic`).
+
+---
+
+## `make_curl()`
+
+```cpp
+inline CURL* make_curl()
+{
+    CURL* curl = curl_easy_init();
+    if (!curl)
+        return nullptr;
+
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "MultiDownloader/1.0 (libcurl)");
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+
+    return curl;
+}
+```
+
+Najpierw słowo o `inline`: skoro to plik nagłówkowy, może być `#include`owany do wielu plików `.cpp`. Bez `inline`, definicja zwykłej funkcji w nagłówku dołączonym do dwóch `.cpp` dałaby dwie definicje `make_curl` w programie → błąd linkera (znowu ODR). `inline` mówi linkerowi: "jeśli znajdziesz wiele identycznych definicji tej funkcji w różnych jednostkach translacji, to jest to OK, potraktuj je jako jedną" — standardowy trik na funkcje definiowane w nagłówkach.
+
+Krok po kroku:
+
+1. `curl_easy_init()` — tworzy nowy "uchwyt" (handle) libcurl typu `CURL*`. To jest obiekt reprezentujący jedno konkretne połączenie/transfer — każdy plik do pobrania dostaje własny uchwyt.
+2. `if (!curl) return nullptr;` — `curl_easy_init` zwraca `nullptr` przy błędzie (np. brak pamięci), więc sprawdzamy to zanim spróbujemy cokolwiek na nim ustawić.
+3. `curl_easy_setopt(curl, OPCJA, wartość)` — generyczna funkcja libcurl do konfigurowania uchwytu. To wariadyczna funkcja C (przyjmuje `...`), więc typ trzeciego argumentu **musi** dokładnie odpowiadać temu, czego oczekuje dana opcja (stąd `1L` — long, a nie `1` — int, bo tak wymaga API; przekazanie złego typu to częsty, trudny do wyłapania błąd w kodzie z curlem).
+   - `CURLOPT_FOLLOWLOCATION, 1L` — jeśli serwer odpowie przekierowaniem HTTP (301/302), curl automatycznie podąży za nowym adresem zamiast zwrócić samą stronę przekierowania.
+   - `CURLOPT_MAXREDIRS, 10L` — limit liczby przekierowań, żeby nie wpaść w nieskończoną pętlę przekierowań.
+   - `CURLOPT_CONNECTTIMEOUT, 15L` — ile sekund maksymalnie czekać na **nawiązanie** połączenia (nie na cały transfer).
+   - `CURLOPT_TIMEOUT, 0L` — limit czasu na **cały** transfer; `0` = brak limitu (bo duże pliki mogą pobierać się długo).
+   - `CURLOPT_NOSIGNAL, 1L` — mówi curlowi, żeby nie używał sygnałów UNIX-owych (np. do obsługi timeoutów DNS) wewnątrz siebie. To jest **wymagane** w programach wielowątkowych, bo sygnały w curlu bez tej flagi nie są bezpieczne wątkowo i mogłyby np. crashować program albo przerywać inny wątek.
+   - `CURLOPT_SSL_VERIFYPEER, 1L` — weryfikuj certyfikat SSL serwera (czy jest podpisany przez zaufane CA). Zostawienie tego włączonego to podstawowa ochrona przed atakami typu man-in-the-middle.
+   - `CURLOPT_SSL_VERIFYHOST, 2L` — weryfikuj, że nazwa hosta w certyfikacie zgadza się z adresem URL (`2` to jedyna sensowna wartość włączająca tę weryfikację; `0` ją wyłącza).
+   - `CURLOPT_USERAGENT` — string wysyłany w nagłówku HTTP `User-Agent`, część serwerów blokuje żądania bez tego nagłówka.
+   - `CURLOPT_FAILONERROR, 1L` — jeśli serwer zwróci kod HTTP ≥ 400 (np. 404 Not Found), `curl_easy_perform` zwróci błąd zamiast po cichu zapisać treść strony błędu do pliku jako "pobrany plik".
+4. `return curl;` — zwracamy skonfigurowany, ale jeszcze nie użyty uchwyt. To celowo — `make_curl()` daje "surowy, gotowy do pracy" handle; to `downloadOne` dodaje do niego opcje specyficzne dla konkretnego pobierania (URL, callbacki).
+
+---
+
+## Klasa `MultiDownloader`
+
+### Konstruktor
+
+```cpp
+explicit MultiDownloader(size_t maxThreads = 4)
+    : maxThreads_(maxThreads == 0 ? 1 : maxThreads)
+{
+}
+```
+
+- `explicit` blokuje niejawną konwersję — bez tego `MultiDownloader dl = 4;` skompilowałoby się (bo konstruktor przyjmuje jeden `size_t`), co byłoby mylące. Z `explicit` trzeba pisać `MultiDownloader dl(4);`.
+- Lista inicjalizacyjna `: maxThreads_(...)` ustawia pole `maxThreads_`, zabezpieczając się przed `maxThreads == 0` (0 wątków roboczych oznaczałoby, że program zawiśnie w nieskończoność, bo nic by nie pobierało plików z kolejki) — wymuszamy minimum 1.
+
+### `addDownload`
+
+```cpp
+void addDownload(const std::string& url, const std::string& outputPath)
+{
+    auto item          = std::make_shared<DownloadItem>();
+    item->url          = url;
+    item->outputPath   = outputPath;
+    items_.push_back(item);
+}
+```
+
+Tworzy nowy `DownloadItem` na stercie, zarządzany przez `std::shared_ptr` (więc nie musisz ręcznie `delete`ować — kiedy ostatnia referencja zniknie, pamięć się zwolni automatycznie). Wypełnia URL i ścieżkę docelową, dodaje wskaźnik do wektora `items_`. To jest wywoływane **przed** `start()`, z jednego wątku — nie potrzeba tu synchronizacji.
+
+### `start()`
+
+```cpp
+bool start()
+{
+    if (items_.empty())
+        return true;
+
+    for (size_t i = 0; i < items_.size(); ++i)
+        pending_.push(i);
+
+    size_t threadCount = std::min(maxThreads_, items_.size());
+    std::vector<std::thread> workers;
+    workers.reserve(threadCount);
+
+    std::atomic<bool> workersDone{false};
+    std::thread progressThread(&MultiDownloader::progressLoop, this, std::ref(workersDone));
+
+    for (size_t i = 0; i < threadCount; ++i)
+        workers.emplace_back(&MultiDownloader::workerLoop, this);
+
+    for (auto& t : workers)
+        t.join();
+
+    workersDone = true;
+    progressThread.join();
+
+    printFinalSummary();
+
+    bool allOk = true;
+    for (auto& it : items_)
+        if (it->failed) allOk = false;
+
+    return allOk;
+}
+```
+
+To jest "dyrygent" całej operacji. Krok po kroku:
+
+1. Jeśli nie dodano żadnego pliku — nie ma czego robić, zwracamy sukces od razu.
+2. `pending_.push(i)` dla każdego indeksu — wypełniamy kolejkę **indeksami** plików do pobrania (0, 1, 2, ...), a nie samymi obiektami. Kolejka indeksów + osobny wektor `items_` to prostszy sposób niż przekazywanie/kopiowanie samych `DownloadItem` między strukturami.
+3. `threadCount = std::min(maxThreads_, items_.size())` — nie ma sensu tworzyć np. 8 wątków, jeśli masz tylko 3 pliki do pobrania; ograniczamy liczbę wątków do mniejszej z dwóch wartości.
+4. `std::atomic<bool> workersDone{false}` — flaga sterująca, kiedy wątek rysujący pasek postępu ma przestać się kręcić w pętli. Musi być atomowa, bo jeden wątek ją zapisuje (`start()`), a inny czyta (`progressLoop`).
+5. `std::thread progressThread(&MultiDownloader::progressLoop, this, std::ref(workersDone));` — uruchamia nowy wątek, który wykona `this->progressLoop(workersDone)`. Ponieważ `progressLoop` jest metodą niestatyczną, `std::thread` wymaga jawnego przekazania wskaźnika `this` jako drugiego argumentu konstruktora. `std::ref(workersDone)` jest konieczne, bo `std::thread` domyślnie **kopiuje** wszystkie argumenty do wewnętrznego magazynu (żeby uniknąć dangling referencji, gdyby wątek żył dłużej niż zmienna) — `std::ref` opakowuje `workersDone` tak, żeby faktycznie przekazać referencję, a nie kopię (a `std::atomic` i tak nie da się skopiować — jego konstruktor kopiujący jest usunięty — więc bez `std::ref` kod by się nawet nie skompilował).
+6. Pętla `for` tworzy `threadCount` wątków roboczych, każdy wykonujący `this->workerLoop()`.
+7. `for (auto& t : workers) t.join();` — **`join`** blokuje bieżący wątek (ten, w którym wywołano `start()`), dopóki dany wątek `t` się nie zakończy. Robimy to dla wszystkich wątków roboczych po kolei — po tej pętli mamy pewność, że **wszystkie** pliki zostały pobrane (albo zawiodły), bo `workerLoop` kończy działanie dopiero, gdy kolejka `pending_` jest pusta.
+8. `workersDone = true;` — teraz, gdy wiemy że pobieranie się skończyło, każemy wątkowi rysującemu pasek zakończyć pętlę.
+9. `progressThread.join();` — czekamy, aż wątek rysujący faktycznie się zamknie (żeby nie "urwać" go w trakcie pisania do konsoli).
+10. `printFinalSummary()` — drukuje listę plików z wynikiem OK/BŁĄD.
+11. Sprawdzamy flagę `failed` na każdym elemencie i zwracamy `true` tylko jeśli **żaden** się nie wywalił.
+
+### `workerLoop()`
+
+```cpp
+void workerLoop()
+{
+    while (true)
+    {
+        size_t index;
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            if (pending_.empty())
+                return;
+            index = pending_.front();
+            pending_.pop();
+        }
+        downloadOne(items_[index]);
+    }
+}
+```
+
+To jest ciało każdego wątku roboczego — klasyczny wzorzec **thread pool / producer-consumer** (tu bez producenta w trakcie działania, kolejka jest wypełniona z góry).
+
+- `while (true)` — wątek w kółko próbuje wziąć kolejne zadanie, dopóki kolejka się nie wyczerpie.
+- `std::lock_guard<std::mutex> lock(queueMutex_);` — blokuje muteks na czas trwania bloku `{ }` (RAII znowu: destruktor `lock_guard` automatycznie odblokuje muteks przy wyjściu z bloku, nawet gdybyśmy wyszli przez `return`). Muteks jest tu **konieczny**, bo `pending_` (zwykła `std::queue`, niewątkowo-bezpieczna) jest czytana/modyfikowana jednocześnie przez kilka wątków — bez blokady dwa wątki mogłyby np. jednocześnie zrobić `pop()` na tym samym elemencie albo skorumpować wewnętrzną strukturę kolejki.
+- `if (pending_.empty()) return;` — nie ma już nic do zrobienia, wątek kończy działanie (funkcja `workerLoop` się kończy, `std::thread` widzi zakończenie i pozwala się później `join`ować).
+- `index = pending_.front(); pending_.pop();` — bierzemy indeks z przodu kolejki i usuwamy go z niej — od teraz ten konkretny plik "należy" tylko do tego wątku.
+- Blok kończy się, muteks jest zwalniany (ważne: **poza** blokiem, więc podczas samego pobierania pliku (`downloadOne`) muteks jest już wolny — inne wątki mogą w tym czasie brać kolejne zadania z kolejki równolegle).
+- `downloadOne(items_[index]);` — właściwe pobieranie, wykonywane **bez** trzymania muteksu (bo trwa długo, a blokowanie innych wątków na czas całego pobierania zabiłoby całą ideę równoległości).
+
+### `downloadOne(...)`
+
+```cpp
+void downloadOne(std::shared_ptr<DownloadItem> item)
+{
+    FILE* file = std::fopen(item->outputPath.c_str(), "wb");
+    if (!file) { ... item->finished = true; return; }
+
+    CURL* curl = make_curl();
+    if (!curl) { std::fclose(file); ... item->finished = true; return; }
+
+    curl_easy_setopt(curl, CURLOPT_URL, item->url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &MultiDownloader::writeCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, file);
+
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, &MultiDownloader::progressCallback);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, item.get());
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+
+    CURLcode res = curl_easy_perform(curl);
+
+    long httpCode = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+
+    curl_easy_cleanup(curl);
+    std::fclose(file);
+
+    if (res != CURLE_OK) { item->failed = true; item->errorMessage = ...; }
+    item->finished = true;
+}
+```
+
+To serce pojedynczego pobierania, wykonywane osobno dla każdego pliku w swoim wątku:
+
+1. `std::fopen(ścieżka, "wb")` — otwiera (tworzy/nadpisuje) plik lokalny w trybie **write binary**. Binarny, żeby nie było żadnej konwersji znaków końca linii (co psułoby np. pliki ZIP czy EXE).
+2. Jeśli `fopen` zwróci `nullptr` (np. brak uprawnień, zły katalog) — oznaczamy `failed`/`finished` i kończymy wcześnie (`return`), nie próbując dalej używać curla.
+3. `make_curl()` — nowy, świeży uchwyt curl **dla tego jednego pliku** (każdy wątek/plik ma własny `CURL*`, curl nie pozwala bezpiecznie współdzielić jednego uchwytu między wątkami).
+4. `CURLOPT_URL` — ustawiamy adres, z którego pobieramy.
+5. `CURLOPT_WRITEFUNCTION, &writeCallback` — mówimy curlowi: "gdy dostaniesz kawałek danych z sieci, wywołaj tę funkcję". To wskaźnik na funkcję statyczną (patrz niżej dlaczego musi być statyczna).
+6. `CURLOPT_WRITEDATA, file` — dowolny wskaźnik "użytkownika", który curl przekaże jako ostatni argument do `writeCallback` przy każdym wywołaniu — tutaj to uchwyt pliku, do którego mamy zapisywać.
+7. `CURLOPT_XFERINFOFUNCTION, &progressCallback` — analogicznie, ale to callback wywoływany okresowo w trakcie transferu z informacją o postępie.
+8. `CURLOPT_XFERINFODATA, item.get()` — wskaźnik użytkownika przekazywany do `progressCallback`; tutaj surowy wskaźnik na nasz `DownloadItem` (żeby callback mógł zaktualizować liczniki bajtów).
+9. `CURLOPT_NOPROGRESS, 0L` — domyślnie curl ma **wyłączone** wywoływanie funkcji postępu (dla wydajności); `0L` = "false" = włącz wywoływanie progress callbacka. (Mylące nazewnictwo w API curla: `NOPROGRESS = 0` znaczy "chcę progress".)
+10. `curl_easy_perform(curl)` — to jest wywołanie **blokujące i synchroniczne**: nawiązuje połączenie, wysyła żądanie, odbiera cały plik, wielokrotnie wywołując po drodze `writeCallback` i `progressCallback`, i wraca dopiero gdy transfer się skończy (sukcesem lub błędem). To dlatego cała ta operacja musi siedzieć w osobnym wątku — inaczej zablokowałaby cały program na czas pobierania jednego pliku.
+11. `curl_easy_getinfo(..., CURLINFO_RESPONSE_CODE, &httpCode)` — pobiera kod HTTP odpowiedzi (200, 404 itd.) po zakończeniu transferu — obecnie w kodzie tylko odczytany, nie jest jeszcze nigdzie wypisywany, ale jest dostępny gdybyś chciał go dodać do komunikatu błędu.
+12. `curl_easy_cleanup(curl)` — zwalnia uchwyt curl (przeciwieństwo `curl_easy_init`) — **musi** być wywołane, inaczej wyciek pamięci/zasobów przy każdym pobranym pliku.
+13. `std::fclose(file)` — zamyka i flushuje plik na dysk.
+14. Jeśli `res != CURLE_OK` (czyli `curl_easy_perform` nie zwróciło "wszystko OK") — oznaczamy błąd i zapisujemy czytelny komunikat przez `curl_easy_strerror(res)`, które tłumaczy kod błędu na string.
+15. Na końcu zawsze `item->finished = true;` — niezależnie od sukcesu/porażki, ten plik jest "skończony" z punktu widzenia paska postępu i podsumowania.
+
+### `writeCallback` i `progressCallback` — dlaczego `static`?
+
+```cpp
+static size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata)
+{
+    FILE* file = static_cast<FILE*>(userdata);
+    return std::fwrite(ptr, size, nmemb, file);
+}
+```
+
+libcurl to biblioteka napisana w **czystym C**. C nie zna metod obiektowych — wskaźnik na funkcję w C to zawsze zwykły adres funkcji, bez ukrytego `this`. Metoda niestatyczna w C++ (`void MultiDownloader::foo()`) w rzeczywistości pod spodem przyjmuje niejawny pierwszy argument `this`, więc jej "prawdziwa" sygnatura nie pasuje do tego, czego oczekuje `CURLOPT_WRITEFUNCTION` (funkcja C-owa o konkretnej sygnaturze, bez `this`). Dlatego callbacki muszą być albo zwykłymi funkcjami globalnymi, albo — jak tutaj — metodami **statycznymi** (statyczna metoda klasy też nie ma `this`, więc jej sygnatura jest zgodna).
+
+Skoro callback nie ma dostępu do `this` ani do żadnego konkretnego obiektu, libcurl daje furtkę: parametr `void* userdata` (ustawiany przez `CURLOPT_WRITEDATA`/`CURLOPT_XFERINFODATA`) — dowolny wskaźnik, który sami podajemy, a curl "w ciemno" oddaje z powrotem przy każdym wywołaniu callbacka. To standardowy C-owy sposób przekazywania "kontekstu" do callbacków.
+
+Sygnatura `writeCallback`:
+- `ptr` — wskaźnik na kawałek danych, jaki właśnie przyszedł z sieci.
+- `size`, `nmemb` — rozmiar jednego elementu i liczba elementów (razem: `size * nmemb` bajtów danych; historyczna konwencja wzorowana na `fwrite` z C).
+- `userdata` — nasz `FILE*` przekazany przez `CURLOPT_WRITEDATA`, rzutowany z powrotem z `void*` na `FILE*`.
+- `std::fwrite(ptr, size, nmemb, file)` — dosłownie zapisuje odebrane bajty do pliku na dysku, zwraca liczbę faktycznie zapisanych elementów. **Ważne**: curl sprawdza wartość zwróconą — jeśli różni się od `size * nmemb` (czyli nie wszystko się zapisało, np. brak miejsca na dysku), curl uznaje to za błąd i przerywa transfer.
+
+```cpp
+static int progressCallback(void* clientp, curl_off_t dltotal, curl_off_t dlnow,
+                             curl_off_t /*ultotal*/, curl_off_t /*ulnow*/)
+{
+    auto* item = static_cast<DownloadItem*>(clientp);
+    item->totalBytes      = dltotal;
+    item->downloadedBytes = dlnow;
+    return 0;
+}
+```
+
+- `clientp` — nasz `DownloadItem*` przekazany przez `CURLOPT_XFERINFODATA`, odzyskany rzutowaniem z `void*`.
+- `dltotal` / `dlnow` — całkowity rozmiar do pobrania (jeśli serwer go podał w nagłówku `Content-Length`) i ile już pobrano.
+- `ultotal` / `ulnow` — to samo, ale dla **wysyłania** (upload) — tu nas nie interesuje, więc parametry są nienazwane (zakomentowane `/*ultotal*/`), żeby kompilator nie ostrzegał o nieużywanych parametrach, ale sygnatura musi je mieć, bo curl zawsze wywołuje callback z tymi czterema argumentami.
+- Zapisujemy wartości do atomowych pól `DownloadItem` — to jedyne miejsce, gdzie te liczniki są aktualizowane, wywoływane cyklicznie przez curla w trakcie `curl_easy_perform`.
+- `return 0;` — zwrócenie czegokolwiek innego niż 0 mówi curlowi "przerwij transfer natychmiast" (przydatne np. do implementacji przycisku Anuluj — tu z tego nie korzystamy, zawsze pozwalamy kontynuować).
+
+### `progressLoop(...)`
+
+```cpp
+void progressLoop(std::atomic<bool>& workersDone)
+{
+    auto lastTime  = steady_clock::now();
+    curl_off_t lastBytes = 0;
+    double speedBytesPerSec = 0.0;
+
+    while (!workersDone)
+    {
+        renderProgress(lastTime, lastBytes, speedBytesPerSec);
+        std::this_thread::sleep_for(milliseconds(150));
+    }
+    renderProgress(lastTime, lastBytes, speedBytesPerSec);
+    std::cout << "\n";
+}
+```
+
+Ciało osobnego wątku odpowiedzialnego wyłącznie za rysowanie paska:
+
+- `lastTime`, `lastBytes`, `speedBytesPerSec` — lokalne zmienne (nie atomowe — bo dotyka ich tylko ten jeden wątek) używane do liczenia prędkości pobierania w czasie.
+- Pętla `while (!workersDone)` — dopóki wątki robocze nie skończyły, co 150ms odświeżamy linię w konsoli.
+- `std::this_thread::sleep_for(milliseconds(150))` — usypia **ten** wątek na 150ms, żeby nie zużywać 100% jednego rdzenia CPU na ciągłe odświeżanie (rysowanie w konsoli częściej niż kilka razy na sekundę i tak nie byłoby zauważalne dla oka).
+- Po wyjściu z pętli (czyli gdy `start()` ustawi `workersDone = true`) — jeszcze jedno, ostatnie odświeżenie (żeby pasek pokazał realne 100%, a nie ostatnią wartość sprzed 150ms), i `"\n"` żeby "zamknąć" linię paska postępu i przejść do podsumowania w nowej linii.
+
+### `renderProgress(...)`
+
+```cpp
+void renderProgress(std::chrono::steady_clock::time_point& lastTime,
+                     curl_off_t& lastBytes, double& speedBytesPerSec)
+{
+    curl_off_t downloaded = 0, total = 0;
+    size_t doneCount = 0;
+
+    for (auto& item : items_) {
+        downloaded += item->downloadedBytes.load();
+        total      += item->totalBytes.load();
+        if (item->finished) ++doneCount;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    double dt = std::chrono::duration<double>(now - lastTime).count();
+    if (dt >= 0.3) {
+        speedBytesPerSec = (downloaded - lastBytes) / dt;
+        lastBytes = downloaded;
+        lastTime  = now;
+    }
+
+    double percent = ...;
+    int filled = ...;
+
+    std::ostringstream line;
+    line << "\rPobieranie: [" << ... << "] " << percent << "%  (" << doneCount << "/" << items_.size() << " plikow)  "
+         << formatBytes(downloaded) << " / " << ... << "  " << formatSpeed(speedBytesPerSec) << "   ";
+
+    std::cout << line.str() << std::flush;
+}
+```
+
+- Najpierw **sumujemy** postęp ze wszystkich plików (`item->downloadedBytes.load()` — jawne `.load()` na `std::atomic`, bo `std::atomic` nie ma niejawnej konwersji domyślnie czytelnej jak zwykły typ w każdym kontekście, choć często i tak działa niejawnie; jawny `.load()` jest czytelniejszy i jednoznaczny).
+- Liczymy `dt` (upływ czasu od ostatniego pomiaru prędkości) w sekundach jako `double`, korzystając z `std::chrono::steady_clock` — zegara, który **nie cofa się i nie przeskakuje** (w przeciwieństwie do zegara systemowego, który może się zmienić np. przy synchronizacji NTP) — idealny do mierzenia interwałów czasu.
+- Prędkość liczymy tylko co ~0.3 sekundy (`dt >= 0.3`), żeby uniknąć "migotania" wartości przy zbyt częstych, drobnych próbkach (dzielenie małej różnicy bajtów przez małą różnicę czasu daje bardzo niestabilny wynik).
+- `percent`, `filled` — przeliczenie procentu na liczbę znaków `#` w pasku (30-znakowy pasek, `filled` to ile znaków ma być wypełnionych).
+- `std::ostringstream line` — budujemy cały tekst linii w buforze string, zamiast wypisywać kawałek po kawałku bezpośrednio do `std::cout` — dzięki temu cała linia trafia na ekran "za jednym razem" (mniej migotania).
+- `"\r"` na początku (**carriage return**, nie nowa linia) — cofa kursor konsoli na początek **tej samej** linii, dzięki czemu kolejne wywołania `renderProgress` nadpisują poprzednią treść zamiast dopisywać nowe linijki — to jest właśnie ten efekt "żywego" paska postępu znanego z PowerShella.
+- `std::flush` — wymusza natychmiastowe wypisanie na ekran (bez tego dane mogłyby czekać w buforze `std::cout` i pasek "nie ruszałby się" wizualnie mimo że program działa poprawnie).
+
+### `printFinalSummary()`
+
+Prosta pętla po wszystkich `items_`, drukująca dla każdego OK albo BŁĄD z treścią `errorMessage` — czysto kosmetyczne podsumowanie na koniec.
+
+### `formatBytes(...)` i `formatSpeed(...)`
+
+```cpp
+static std::string formatBytes(curl_off_t bytes)
+{
+    double b = static_cast<double>(bytes);
+    const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+    int u = 0;
+    while (b >= 1024.0 && u < 4) { b /= 1024.0; ++u; }
+    ...
+}
+```
+
+Klasyczny algorytm "ładnego" formatowania rozmiaru: dzielimy przez 1024 tak długo, aż liczba spadnie poniżej 1024 albo skończą się jednostki (max TB), zliczając ile razy podzieliliśmy (`u` = indeks jednostki: 0=B, 1=KB, 2=MB...). Potem formatujemy przez `std::ostringstream` z ustaloną liczbą miejsc po przecinku (0 dla bajtów, bo "0.0 B" nie ma sensu; 1 dla reszty).
+
+`formatSpeed` po prostu woła `formatBytes` na zaokrąglonej do `curl_off_t` wartości i doklejone `/s`.
+
+---
+
+Jeśli chcesz, mogę też przejść krok po kroku przez to, co się dzieje **w pamięci i w czasie** przy przykładowym uruchomieniu z 5 plikami i 2 wątkami (czyli dosłowna symulacja kolejnych "tick'ów" wątków) — to często najlepiej domyka zrozumienie takiego kodu.
