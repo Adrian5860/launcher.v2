@@ -1,4 +1,4 @@
-.vscode/
-curl-8.22.0_1-win64-mingw/
-mingw64/
-miniz-3.1.2/
+.vscode/**
+curl-8.22.0_1-win64-mingw/**
+mingw64/**
+miniz-3.1.2/**
