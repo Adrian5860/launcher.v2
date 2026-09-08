@@ -1,0 +1,4 @@
+.vscode/** linguist-vendored
+curl-8.22.0_1-win64-mingw/** linguist-vendored
+mingw64/** linguist-vendored
+miniz-3.1.2/** linguist-vendored
