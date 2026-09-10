@@ -10,7 +10,6 @@ namespace fs = std::filesystem;
 
 #ifdef _WIN32
 	#include <windows.h>
-	#include <shellapi.h>
 
 	void set_utf8_console()
 	{
@@ -28,10 +27,16 @@ namespace fs = std::filesystem;
 	}
 #endif
 
-const std::string is_active_link = "https://raw.githubusercontent.com/Adrian5860/launcher.v2/main/is_active.txt";
+const std::string is_active_link = "https://raw.githubusercontent.com/Adrian5860/launcher.v2/main/preview.txt";
 const std::string pinecone_link  = "https://github.com/ElyPrismLauncher/Launcher/releases/download/11.1.0/PineconeMC-Windows-MSVC-Portable-11.1.0.zip";
 const std::string modpack_link   = "https://raw.githubusercontent.com/Adrian5860/launcher.v2/main/ligma_modpack.zip";
-std::string Username             = "";
+std::string Username = "";
+bool is_setup        = false;
+char eastereggs      = '0';
+char input;
+/** 0 - no egg
+*  1 - failed to choose 1, 2 or 3.
+*/
 
 MultiDownloader dl(1);
 
@@ -51,7 +56,9 @@ void clear_input()
 //  Zaklada wzgledne sciezki bez polskich znakow.
 // -------------------------------------------------------------------------
 bool create_process(const std::string& exePath,
-                     const std::vector<std::string>& args)
+                     const std::vector<std::string>& args,
+                     const fs::path& waitForFile = {},   // jeśli podane: czekaj aż plik się pojawi, potem zabij
+                     int waitForFileTimeoutMs = 30000)    // max czas oczekiwania w ms
 {
 #ifdef _WIN32
     std::ostringstream cmd;
@@ -68,12 +75,36 @@ bool create_process(const std::string& exePath,
     PROCESS_INFORMATION pi{};
 
     BOOL ok = CreateProcessA(nullptr, buf.data(), nullptr, nullptr,
-                              FALSE, 0, nullptr, "pinecone", &si, &pi);
+                              FALSE, 0, nullptr, ".pinecone", &si, &pi);
     if (!ok)
     {
         std::cerr << "Nie udalo sie uruchomic: " << exePath
                    << " (kod bledu: " << GetLastError() << ")\n";
         return false;
+    }
+
+    if (!waitForFile.empty())
+    {
+        std::cout << "Czekam, az launcher pobierze pakiet jezykowy...\n";
+
+        auto start = std::chrono::steady_clock::now();
+        while (!fs::exists(waitForFile))
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+
+            if (elapsed > waitForFileTimeoutMs)
+            {
+                std::cerr << "Timeout: folder jezykowy sie nie pojawil, przerywam czekanie.\n";
+                break;
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(300)); // daj chwilę na dopisanie pliku
+        TerminateProcess(pi.hProcess, 0);
+        WaitForSingleObject(pi.hProcess, INFINITE);
     }
 
     CloseHandle(pi.hProcess);
@@ -118,13 +149,6 @@ bool create_process(const std::string& exePath,
     int status = 0;
     waitpid(pid, &status, 0);
 
-    if (waitForExit)
-    {
-        // UWAGA: nie mamy juz PID-u wnuka, wiec prawdziwe "czekanie na
-        // wnuka" nie jest tu mozliwe w prosty sposob - patrz uwaga nizej
-        std::cerr << "Ostrzezenie: waitForExit=true nie jest w pelni obslugiwane "
-                     "przy odlaczonym procesie potomnym na Linuksie.\n";
-    }
     return true;
 #endif
 }
@@ -196,9 +220,11 @@ bool extract_archive(const std::string& archivePath, const std::string& destDir)
 // -------------------------------------------------------------------------
 // pobiera modpack, czyli archiwum .zip zawierające mody itd.
 // -------------------------------------------------------------------------
-void import_modpack()
+// true - rozpakowuje i usuwa.zip
+// false - zostawia .zip
+void import_modpack(fs::path modpackPath, const bool& extract)
 {
-    if(fs::exists("pinecone/instances/ligma_modpack/minecraft")) //???
+    if(fs::exists(modpackPath.generic_string() + "/minecraft")) //???
     {
         if(fs::exists("ligma_modpack.zip")) fs::remove("ligma_modpack.zip");
 
@@ -206,7 +232,10 @@ void import_modpack()
     }
     else
     {
-        fs::create_directories("pinecone/instances/ligma_modpack");
+        if(!extract)
+        {
+            fs::create_directories(modpackPath);
+        }
     }
     std::cout << "Pobieranie paczki modów...\n";
 
@@ -220,13 +249,20 @@ void import_modpack()
             std::cerr << "Pobieranie nie powiodlo sie, przerywam.\n";
             return;
         }
+        
+        dl.clearQueue();
     }
     else
     {
         std::cout << "ligma_modpack.zip jest już pobrany.";
     }
 
-    if(extract_archive("ligma_modpack.zip", "pinecone/instances/ligma_modpack"))
+    if(!extract)
+    {
+        return;
+    }
+
+    if(extract_archive("ligma_modpack.zip", modpackPath.generic_string()))
     {
         fs::remove("ligma_modpack.zip");
     }
@@ -237,7 +273,13 @@ void import_modpack()
 // -------------------------------------------------------------------------
 void check_installation()
 {
-    if(fs::exists("pinecone/elyprismlauncher.exe"))
+    if(!fs::exists(".pinecone"))
+    {
+        fs::create_directory(".pinecone");
+        // SetFileAttributesA(".pinecone", FILE_ATTRIBUTE_HIDDEN);
+    }
+
+    if(fs::exists(".pinecone/elyprismlauncher.exe"))
     {
         std::cout << "PineconeMC jest już zainstalowany.\n";
         
@@ -258,13 +300,15 @@ void check_installation()
             std::cerr << "Pobieranie nie powiodlo sie, przerywam.\n";
             return;
         }
+
+        dl.clearQueue();
     }
     else
     {
         std::cout << "PineconeMC.zip jest już pobrany.";
     }
 
-    if(extract_archive("PineconeMC.zip", "pinecone"))
+    if(extract_archive("PineconeMC.zip", ".pinecone"))
     {
         fs::remove("PineconeMC.zip");
     }
@@ -362,11 +406,11 @@ bool patch_it()
     };
 
     if(
-        create_if_missing("pinecone/MultiMC_nomigrate.txt") &&
-        create_if_missing("pinecone/PolyMC_nomigrate.txt") && 
-        create_if_missing("pinecone/Prism Launcher_nomigrate.txt") &&
-        save_file_accounts_json("pinecone/accounts.json") &&
-        SaveElyprismlauncherCfg("pinecone/elyprismlauncher.cfg")
+        create_if_missing(".pinecone/MultiMC_nomigrate.txt") &&
+        create_if_missing(".pinecone/PolyMC_nomigrate.txt") && 
+        create_if_missing(".pinecone/Prism Launcher_nomigrate.txt") &&
+        save_file_accounts_json(".pinecone/accounts.json") &&
+        SaveElyprismlauncherCfg(".pinecone/elyprismlauncher.cfg")
     )
     {
         return true;
@@ -375,22 +419,58 @@ bool patch_it()
     return false;
 }
 
-// -------------------------------------------------------------------------
-//  Uruchamia gotowy launcher 
-// -------------------------------------------------------------------------
-void launch_game()
+bool save_choices_cfg(const fs::path& file)
 {
-    create_process("pinecone\\elyprismlauncher.exe", {"-lligma_modpack", "-a" + Username});
+    std::ofstream c(file, std::ios::binary);
+    if (!c.is_open())
+    {
+        std::cerr << "Nie udało się otworzyć " << file << '\n';
+        return false;
+    }
+
+    c << "Input=" << input << '\n';
+    c << "EasterEggs=" << eastereggs << '\n';
+    c << "Username=" << Username << '\n';
+    c << "Setup=" << (is_setup ? '1' : '0') << '\n';
+
+    return c.good();
+}
+
+// -------------------------------------------------------------------------
+//  Uruchamia funkcje przygotowujące i gotowy launcher 
+// -------------------------------------------------------------------------
+// true - sam launcher
+// false - launcher, modpack itd.
+void launch_game(const bool& no_args)
+{
+    check_installation();
+    if(!patch_it())
+    {
+        std::cerr << "Nie udało się zastosować 'poprawek'.\n";
+    }
+    import_modpack(".pinecone/instances/ligma_modpack", true);
+    
+    if (!is_setup)
+    {
+        create_process(".pinecone\\elyprismlauncher.exe", {}, ".pinecone/translations/index_v2.json");
+
+        is_setup = true;
+        save_choices_cfg("choices.cfg");
+    }
+
+    if(no_args)
+    {
+        create_process(".pinecone\\elyprismlauncher.exe", {});
+    }
+    else
+    {
+        create_process(".pinecone\\elyprismlauncher.exe", {"-lligma_modpack", "-a" + Username});
+    }
     std::exit(0);
 }
 
 void setup(fs::path file)
 {
-    char input, eastereggs = '0';
-    /** 0 - no egg
-     *  1 - failed to choose 1, 2 or 3.
-    */
-
     if(fs::exists(file))
     {
         // załaduj choices.cfg
@@ -424,12 +504,16 @@ void setup(fs::path file)
             {
                 Username = value;
             }
+            else if (key == "Setup")
+            {
+                is_setup = std::stoi(value);
+            }
         }
         c.close();
     }
     else
     {   
-        if(!fs::exists("pinecone/accounts.json") || Username == "")
+        if(!fs::exists(".pinecone/accounts.json") || Username == "")
         {
             std::cout << "Podaj nazwę użytkownika - taki nick będziesz mieć w grze.\nWpisanie nieprawidłowej nazwy spowoduje to, że launcher się nie uruchomi.\nNaciśnij 'Enter' aby zatwierdzić...\n\n";
             std::cin >> Username;
@@ -461,36 +545,24 @@ void setup(fs::path file)
                 std::cout << "Nie uczysz się na błędach co? Wybierz jedną z dostępnych opcji poprzez wpisanie odpowiedniej liczby i wciśnij 'Enter' ...\n";
             }
         }
-
-        // zapisz choices.cfg
-        std::ofstream c(file, std::ios::binary);
-        if (!c.is_open())
-        {
-            std::cerr << "Nie udało się otworzyć " << file << '\n';
-        }
-
-        c << "Input=" << input << '\n';
-        c << "EasterEggs=" << eastereggs << '\n';
-        c << "Username=" << Username << '\n';
-
-        c.close();
+        save_choices_cfg(file);
     }
     switch(input)
     {  
+        case '1':
+            launch_game(false);
+            break;
         case '2':
-            
+            launch_game(true);
             break;
         case '3':
-            
+            import_modpack("ligma_modpack", false);
+            std::cout << "Możesz importować całą paczkę jako .zip, lub rozpakować archiwum i skopiować mody z folderu './minecraft/mods'.\n";
+            std::this_thread::sleep_for(std::chrono::seconds(5));
             break;
-        default: //case '1'
-            check_installation();
-            if(!patch_it())
-            {
-                std::cerr << "Nie udało się zastosować 'poprawek'.\n";
-            }
-            import_modpack();
-            launch_game();
+        default: 
+            std::cerr << "jeżeli widzisz tą linijkę tekstu to znaczy że zepsułeś config.cfg\nI wiesz co? też cię lubię :)\n";
+            fs::rename("choices.cfg", "po_co_ci_to_bylo--usun_to.cfg");
     }
 }
 
