@@ -115,6 +115,12 @@ public:
         items_.push_back(item);
     }
 
+    // Czyści kolejkę pobierania.
+    void clearQueue()
+    {
+        items_.clear();
+    }
+
     // Blokuje wątek wywołujący, dopóki wszystkie pliki się nie pobiorą
     // (albo nie zawiodą). Rysuje pasek postępu w konsoli.
     // Zwraca true, jeśli WSZYSTKIE pliki pobrały się poprawnie.
